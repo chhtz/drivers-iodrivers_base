@@ -1,8 +1,3 @@
-#define BOOST_TEST_DYN_LINK
-#define BOOST_TEST_MAIN
-#define BOOST_TEST_MODULE "iodrivers"
-#define BOOST_AUTO_TEST_MAIN
-#include <boost/test/auto_unit_test.hpp>
 #include <boost/test/unit_test.hpp>
 
 #include <sys/types.h>
@@ -34,10 +29,12 @@ public:
     }
 };
 
-int setupDriver(Driver& driver)
+template<typename DriverType>
+int setupDriver(DriverType& driver)
 {
     int pipes[2];
-    pipe(pipes);
+    if (pipe(pipes) == -1)
+        throw std::runtime_error("failed to create the pipe for the test driver");
     int rx = pipes[0];
     int tx = pipes[1];
 
@@ -50,7 +47,9 @@ int setupDriver(Driver& driver)
 
 void writeToDriver(Driver& driver, int tx, uint8_t const* data, int size)
 {
-    write(tx, data, size);
+    int tx_bytes = write(tx, data, size);
+    if (tx_bytes != size)
+        throw std::runtime_error("failed to write");
 }
 
 
@@ -309,4 +308,81 @@ BOOST_AUTO_TEST_CASE(test_hasPacket_returns_false_on_internal_buffer_with_garbag
     uint8_t buffer[100];
     BOOST_REQUIRE_EQUAL(4, test.readPacket(buffer, 100, 10, 1));
     BOOST_REQUIRE(!test.hasPacket());
+}
+
+class FlushReadBufferTest : public Driver
+{
+public:
+    FlushReadBufferTest()
+        : Driver(100) {}
+
+    int extractPacket(uint8_t const* buffer, size_t buffer_size) const
+    {
+        if (buffer[0] != 0)
+            return -1;
+        int size = buffer[1];
+        if (buffer_size < size)
+            return 0;
+
+        if (buffer[size - 1] == 0)
+            return size;
+        return -1;
+    }
+};
+
+BOOST_AUTO_TEST_CASE(test_flushReadBuffer_skips_partial_packages_until_it_finds_one)
+{
+    FlushReadBufferTest test;
+    int tx = setupDriver(test);
+    FileGuard tx_guard(tx);
+    writeToDriver(test, tx, reinterpret_cast<uint8_t const*>("\x0\xf\x0\xf\x0\x3\x0"), 7);
+    uint8_t buffer[100];
+    size_t size = test.flushReadBuffer(buffer, 100);
+    BOOST_REQUIRE_EQUAL(3, size);
+    BOOST_REQUIRE(!memcmp(buffer, "\x0\x3\x0", 3));
+}
+
+BOOST_AUTO_TEST_CASE(test_flushReadBuffer_completely_empties_the_read_buffer_if_there_is_no_packet_in_it)
+{
+    FlushReadBufferTest test;
+    int tx = setupDriver(test);
+    FileGuard tx_guard(tx);
+    writeToDriver(test, tx, reinterpret_cast<uint8_t const*>("\x0\xf\x0\xf\x0\x3"), 6);
+    uint8_t buffer[100];
+    BOOST_REQUIRE_EQUAL(0, test.flushReadBuffer(buffer, 100));
+    BOOST_REQUIRE(test.isReadBufferEmpty());
+}
+BOOST_AUTO_TEST_CASE(test_flushReadBuffer_accounts_for_the_lost_bytes_as_bad_rx)
+{
+    FlushReadBufferTest test;
+    int tx = setupDriver(test);
+    FileGuard tx_guard(tx);
+    writeToDriver(test, tx, reinterpret_cast<uint8_t const*>("\x0\xf\x0\xf\x0\x3\x0"), 7);
+    uint8_t buffer[100];
+    test.flushReadBuffer(buffer, 100);
+    BOOST_REQUIRE_EQUAL(4, test.getStats().bad_rx);
+}
+
+BOOST_AUTO_TEST_CASE(test_readPacket_will_flush_the_read_buffer_if_setFlushOnTimeout_is_set)
+{
+    FlushReadBufferTest test;
+    test.setFlushOnTimeout(true);
+    int tx = setupDriver(test);
+    FileGuard tx_guard(tx);
+    writeToDriver(test, tx, reinterpret_cast<uint8_t const*>("\x0\xf\x0\xf\x0\x3\x0"), 7);
+    uint8_t buffer[100];
+    size_t size = test.readPacket(buffer, 100);
+    BOOST_REQUIRE_EQUAL(3, size);
+    BOOST_REQUIRE(!memcmp(buffer, "\x0\x3\x0", 3));
+}
+
+BOOST_AUTO_TEST_CASE(test_readPacket_will_throw_a_timeout_error_if_setFlushOnTimeout_is_set_and_no_package_is_available)
+{
+    FlushReadBufferTest test;
+    test.setFlushOnTimeout(true);
+    int tx = setupDriver(test);
+    FileGuard tx_guard(tx);
+    writeToDriver(test, tx, reinterpret_cast<uint8_t const*>("\x0\xf\x0\xff sfa\x0\x3"), 10);
+    uint8_t buffer[100];
+    BOOST_REQUIRE_THROW(test.readPacket(buffer, 100), TimeoutError);
 }

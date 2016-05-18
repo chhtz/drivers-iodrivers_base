@@ -1,4 +1,4 @@
-rock_testsuite(test_suite test.cpp
+rock_testsuite(test_suite suite.cpp test.cpp
     DEPS iodrivers_base)
 
 rock_executable(test_tcp_read test_tcp_read.cpp
